@@ -25,11 +25,11 @@ BATCH_SIZE      = 32
 EPOCHS          = 50
 LEARNING_RATE   = 1e-3
 DROPOUT_RATE    = 0.5
-NUM_CLASSES     = 4
+NUM_CLASSES     = 3
 TRAIN_DIR       = "dataset/train"
 VAL_DIR         = "dataset/val"
 BEST_MODEL_PATH = "best_fer_model.keras"   # Format .keras lebih stabil di Keras 3
-CLASS_NAMES     = ["Bingung", "Netral", "Negatif", "Positif"]  # akan di-override oleh dataset
+CLASS_NAMES     = ["Negatif", "Netral", "Positif"]  # akan di-override oleh dataset
 
 keras.utils.set_random_seed(42)
 
@@ -265,7 +265,7 @@ def main():
         raise FileNotFoundError(
             f"Folder dataset tidak ditemukan!\n"
             f"Buat folder '{TRAIN_DIR}' dan '{VAL_DIR}' dengan sub-folder kelas:\n"
-            f"  Positif/, Netral/, Bingung/, Negatif/"
+            f"  Positif/, Netral/, Negatif/"
         )
 
     # 1. Bangun dataset pipeline

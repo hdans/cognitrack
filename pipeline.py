@@ -20,13 +20,11 @@ from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarkerResult
 
 # Import mesin fuzzy dari Fase 2 (harus ada di folder yang sama)
 try:
-    from fase2_fuzzy_engine import (
+    from fuzzy_engine import (
         build_fuzzy_variables,
         build_rules,
         build_control_system,
         compute_engagement,
-        class_to_emosi_value,
-        CNN_CLASS_TO_EMOSI,
     )
     FUZZY_AVAILABLE = True
 except ImportError:
@@ -46,6 +44,7 @@ CALIB_SECONDS    = 3            # durasi kalibrasi (detik)
 CALIB_TARGET_EAR = 0.32        # nilai EAR "waspada" target setelah normalisasi
 EAR_DROWSY_RATIO = 0.60        # jika EAR < 60% baseline → dianggap mengantuk
 EAR_TIRED_RATIO  = 0.78        # jika EAR < 78% baseline → dianggap lelah
+EAR_THRESHOLD    = 0.19        # fallback threshold saat fuzzy engine tidak tersedia
 
 # URL model MediaPipe Face Landmarker (diunduh otomatis jika belum ada)
 MODEL_URL  = ("https://storage.googleapis.com/mediapipe-models/"
@@ -77,7 +76,14 @@ MODEL_3D_POINTS = np.array([
 ], dtype=np.float64)
 POSE_LM_IDX = [1, 152, 263, 33, 287, 57]
 
-EMOTION_CLASSES = ["Negatif", "Bingung", "Netral", "Positif"]
+EMOTION_CLASSES = ["Negatif", "Netral", "Positif"]
+
+# FER model (optional) and smoothing params
+FER_MODEL_PATH = "best_fer_model.keras"
+FER_IMG_SIZE = 224
+PROBS_SMOOTH_N = 8        # number of frames to average probabilities over
+PROB_EMA_ALPHA = 0.35     # EMA smoothing factor for averaged probs
+PROB_MIN_DIFF = 0.12      # minimum gap between top2 probs to accept class change
 
 # Download Model
 
@@ -117,7 +123,7 @@ def calibrate_ear(cap, landmarker) -> float:
     print("[KALIB] Tekan SPASI saat posisi Anda sudah netral/normal untuk submit baseline.")
     print("[KALIB] Tekan 'q' untuk lewati kalibrasi (pakai default 0.30).")
 
-    # Rolling buffer — simpan 30 frame terakhir (~1 detik di 30fps)
+    # Rolling buffer - simpan 30 frame terakhir (~1 detik di 30fps)
     BUFFER_SIZE = 30
     ear_buffer  = []
     submitted   = False
@@ -181,7 +187,7 @@ def calibrate_ear(cap, landmarker) -> float:
 
             # Warna panel: hijau = stabil, kuning = belum stabil
             panel_color = COLOR_GREEN if stable else COLOR_ORANGE
-            stability_txt = "STABIL — siap submit!" if stable else "Tunggu hingga stabil..."
+            stability_txt = "STABIL - siap submit!" if stable else "Tunggu hingga stabil..."
 
             cv2.rectangle(frame,
                           (img_w//2 - 200, img_h//2 + 60),
@@ -202,7 +208,7 @@ def calibrate_ear(cap, landmarker) -> float:
 
         else:
             # Tidak ada wajah
-            cv2.putText(frame, "⚠ Wajah tidak terdeteksi — posisikan kembali",
+            cv2.putText(frame, "Wajah tidak terdeteksi - posisikan kembali",
                         (img_w//2 - 280, img_h//2 + 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, COLOR_RED, 2)
 
@@ -211,7 +217,7 @@ def calibrate_ear(cap, landmarker) -> float:
                     (img_w//2 - 220, img_h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_CYAN, 1)
 
-        cv2.imshow("Smart Engagement Tracker — Fase 3", frame)
+        cv2.imshow("Smart Engagement Tracker - Fase 3", frame)
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -219,7 +225,7 @@ def calibrate_ear(cap, landmarker) -> float:
             if len(ear_buffer) >= 10:
                 baseline    = float(np.median(ear_buffer))
                 submitted   = True
-                print(f"[KALIB] ✓ Baseline dikunci: EAR = {baseline:.4f}  "
+                print(f"[KALIB] OK Baseline dikunci: EAR = {baseline:.4f}  "
                       f"(dari {len(ear_buffer)} sampel)")
                 # Tampilkan konfirmasi 1.5 detik
                 confirm_t = time.time()
@@ -238,7 +244,7 @@ def calibrate_ear(cap, landmarker) -> float:
                     cv2.putText(frame2, "Memulai tracking...",
                                 (frame2.shape[1]//2 - 140, frame2.shape[0]//2 + 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_WHITE, 1)
-                    cv2.imshow("Smart Engagement Tracker — Fase 3", frame2)
+                    cv2.imshow("Smart Engagement Tracker - Fase 3", frame2)
                     cv2.waitKey(1)
             else:
                 print("[KALIB] Belum cukup sampel, posisikan wajah ke kamera dulu.")
@@ -276,11 +282,11 @@ def compute_head_yaw(face_landmarks, img_w, img_h):
     if eye_width < 1e-3:
         return 0.0
 
-    # Deviasi relatif: 0 = lurus, ±0.5 = menoleh ~45°
+    # Deviasi relatif: 0 = lurus, plus/minus 0.5 = menoleh sekitar 45 derajat
     mid_x     = (lx + rx) / 2.0
     deviation = abs(nx - mid_x) / eye_width
 
-    # Konversi ke derajat; secara empiris deviation ~0.40 ≈ 45°
+    # Konversi ke derajat; secara empiris deviation ~0.40 sekitar 45 derajat
     # Clamp ke [0, 90]
     yaw_deg = deviation * (90.0 / 0.40)
     return min(yaw_deg, 90.0)
@@ -295,19 +301,53 @@ def dummy_cnn_predict(face_roi_bgr):
 def top_emotion(prob_dict):
     return max(prob_dict, key=prob_dict.get)
 
+
+# --- Optional: real CNN loader + probability smoothing ---
+def init_cnn_model(path: str):
+    try:
+        from keras.models import load_model
+        model = load_model(path)
+        print(f"[INFO] Loaded FER model: {path}")
+        return model
+    except Exception as e:
+        print(f"[WARN] Tidak dapat memuat model FER '{path}': {e}")
+        return None
+
+
+def predict_emotion_probs(model, face_roi_bgr):
+    # Returns dict {class: prob}
+    if model is None:
+        return dummy_cnn_predict(face_roi_bgr)
+    try:
+        roi = cv2.resize(face_roi_bgr, (FER_IMG_SIZE, FER_IMG_SIZE))
+    except Exception:
+        return dummy_cnn_predict(face_roi_bgr)
+    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+    x = np.expand_dims(roi_rgb.astype("float32"), 0)
+    try:
+        from keras.applications.mobilenet_v2 import preprocess_input
+        x = preprocess_input(x)
+    except Exception:
+        x = x / 255.0
+    try:
+        p = model.predict(x, verbose=0)[0]
+        return {cls: float(prob) for cls, prob in zip(EMOTION_CLASSES, p)}
+    except Exception:
+        return dummy_cnn_predict(face_roi_bgr)
+
 # Fuzzy Engagement Wrapper
 
-def calculate_fuzzy_engagement(simulation, ear, pose_deg, emotion_class):
+def calculate_fuzzy_engagement(simulation, ear, pose_deg, emotion_input, emotion_class=None):
     if not FUZZY_AVAILABLE or simulation is None:
         score = 50.0
         if ear < EAR_THRESHOLD: score -= 30
         if pose_deg > 25:       score -= 20
-        if emotion_class == "Positif": score += 20
-        elif emotion_class == "Negatif": score -= 10
+        fallback_class = emotion_class if emotion_class is not None else max(emotion_input, key=emotion_input.get)
+        if fallback_class == "Positif": score += 20
+        elif fallback_class == "Negatif": score -= 10
         return float(max(0.0, min(100.0, score)))
 
-    emosi_val = class_to_emosi_value(emotion_class)
-    return compute_engagement(simulation, ear, pose_deg, emosi_val, verbose=False)
+    return compute_engagement(simulation, ear, pose_deg, emotion_input, verbose=False)
 
 # Rendering Overlay
 
@@ -378,7 +418,7 @@ def draw_emotion_probs(frame, probs):
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
     PCOLORS = {"Positif": COLOR_GREEN, "Netral": COLOR_CYAN,
-               "Bingung": COLOR_ORANGE, "Negatif": COLOR_RED}
+               "Negatif": COLOR_RED}
     y = y0 + 15
     for cls in EMOTION_CLASSES:
         p = probs.get(cls, 0.0)
@@ -432,6 +472,11 @@ def main():
     # 2. Inisialisasi Fuzzy Engine
     simulation = init_fuzzy_engine()
 
+    # 2b. Inisialisasi (opsional) CNN FER model + smoothing buffers
+    cnn_model = init_cnn_model(FER_MODEL_PATH)
+    probs_buffer = []      # list of np.array probabilities
+    probs_ema = None       # EMA of averaged probabilities
+
     # 3. Inisialisasi MediaPipe Face Landmarker (Tasks API)
     landmarker = init_face_landmarker(MODEL_PATH)
 
@@ -450,11 +495,10 @@ def main():
 
     # State
     ear_buf, pose_buf      = [], []
-    emotion_votes          = []   # buffer majority-vote untuk stabilisasi emosi
     last_fuzzy_t = 0.0
     fuzzy_score  = 50.0
     emotion_cls  = "Netral"
-    probs        = {c: 0.25 for c in EMOTION_CLASSES}
+    probs        = {c: 1.0 / len(EMOTION_CLASSES) for c in EMOTION_CLASSES}
     fps          = 0.0
     prev_t       = time.time()
 
@@ -506,28 +550,52 @@ def main():
             if len(pose_buf) > POSE_SMOOTH_N: pose_buf.pop(0)
             yaw_s = float(np.mean(pose_buf))
 
-            # (d) Crop wajah → CNN dummy
+            # (d) Crop wajah -> CNN dummy
             roi = frame[max(y1,0):y2, max(x1,0):x2]
             if roi.size > 0:
-                probs        = dummy_cnn_predict(roi)
-                raw_emotion  = top_emotion(probs)
-                # Majority vote: ambil emosi yang paling sering muncul
-                # dalam 20 frame terakhir → tidak ikut-ikutan noise tiap frame
-                emotion_votes.append(raw_emotion)
-                if len(emotion_votes) > EMOTION_VOTE_N:
-                    emotion_votes.pop(0)
-                emotion_cls = Counter(emotion_votes).most_common(1)[0][0]
+                probs = predict_emotion_probs(cnn_model, roi)
+                # maintain probs buffer (as numpy arrays in fixed EMOTION_CLASSES order)
+                p_arr = np.array([probs.get(c, 0.0) for c in EMOTION_CLASSES], dtype=float)
+                probs_buffer.append(p_arr)
+                if len(probs_buffer) > PROBS_SMOOTH_N:
+                    probs_buffer.pop(0)
+
+                # average probabilities over buffer
+                avg_probs = np.mean(probs_buffer, axis=0)
+
+                # EMA smoothing on averaged probs to add temporal inertia
+                if probs_ema is None:
+                    probs_ema = avg_probs
+                else:
+                    probs_ema = PROB_EMA_ALPHA * avg_probs + (1.0 - PROB_EMA_ALPHA) * probs_ema
+
+                # Determine top emotion with confidence gap check to avoid flip-flop
+                sorted_idx = np.argsort(probs_ema)[::-1]
+                top_idx, second_idx = int(sorted_idx[0]), int(sorted_idx[1])
+                top_prob, second_prob = float(probs_ema[top_idx]), float(probs_ema[second_idx])
+
+                # Only change class if top margin sufficiently larger than second
+                if (top_prob - second_prob) >= PROB_MIN_DIFF:
+                    raw_emotion = EMOTION_CLASSES[top_idx]
+                else:
+                    raw_emotion = emotion_cls  # keep previous
+
+                # keep human-readable probs dict for overlay
+                probs = {cls: float(p) for cls, p in zip(EMOTION_CLASSES, probs_ema)}
+                emotion_cls = raw_emotion
 
             # (e) Fuzzy setiap FUZZY_INTERVAL detik
             if (now - last_fuzzy_t) >= FUZZY_INTERVAL:
+                fuzzy_score = None
                 try:
                     fuzzy_score = calculate_fuzzy_engagement(
-                        simulation, ear_s, yaw_s, emotion_cls)
+                        simulation, ear_s, yaw_s, probs, emotion_cls)
                 except Exception as e:
                     print(f"[WARN] Fuzzy error: {e}")
                 last_fuzzy_t = now
-                print(f"[Fuzzy] EAR={ear_s:.3f}  Pose={yaw_s:.1f}°  "
-                      f"Emosi={emotion_cls}  Score={fuzzy_score:.2f}")
+                if fuzzy_score is not None:
+                    print(f"[Fuzzy] EAR={ear_s:.3f}  Pose={yaw_s:.1f} deg  "
+                          f"Emosi={emotion_cls}  Score={fuzzy_score:.2f}")
 
             # (f) Overlay
             draw_hud(frame, ear_raw_s, ear_s, ear_baseline, yaw_s, emotion_cls, fuzzy_score, fps)
@@ -538,7 +606,7 @@ def main():
                         (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_ORANGE, 2)
             draw_hud(frame, 0.0, 0.0, ear_baseline, 0.0, "Netral", fuzzy_score, fps)
 
-        cv2.imshow("Smart Engagement Tracker — Fase 3", frame)
+        cv2.imshow("Smart Engagement Tracker - Fase 3", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
